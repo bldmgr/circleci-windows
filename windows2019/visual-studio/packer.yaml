@@ -1,0 +1,168 @@
+variables:
+  # GCE account related
+  project_id: notnoopci-prototype
+  account_file: ""
+
+  # metadata for tagging
+  circle_build_url: '{{ env "CIRCLE_BUILD_URL"}}'
+  circle_job_name: '{{ env "CIRCLE_JOB" }}'
+  helper_script_folder: "C:\\Program Files\\WindowsPowerShell\\Modules\\"
+  test_script_folder: "C:\\tests"
+  shutdown_script_folder: "C:\\shutdown-scripts"
+  circle_sha: '{{ env "CIRCLE_SHA1" }}'
+  circle_hostname: '{{ split (env "CIRCLE_BUILD_URL") "/" 2 }}'
+  circle_workflow_id: '{{ env "CIRCLE_WORKFLOW_ID" }}'
+  gce_region: '{{ split (user "gce_zone") "-" 0 }}'
+
+  # Uncomment below to enable Docker registry mirror
+  # IMPORTANT: Replace https://mirror.gcr.io with your custom registry
+  # dockerhub_registry_mirror: 'https://mirror.gcr.io'
+
+builders:
+  - type: amazon-ebs
+    access_key: ""
+    secret_key: ""
+    region: '{{ user "ami_region" }}'
+    source_ami_filter:
+      filters:
+        virtualization-type: "hvm"
+        root-device-type: "ebs"
+        name: "Windows_Server-2019-English-Full-ECS_Optimized-*"
+      owners: ["amazon"]
+      most_recent: true
+    instance_type: "m5.2xlarge"
+    ami_name: "windows-server-2019-vs2019-{{timestamp}}"
+    user_data_file: ./windows2019/visual-studio/user_data.ps1
+    communicator: "winrm"
+    launch_block_device_mappings:
+      - device_name: "/dev/sda1"
+        volume_size: 160
+        volume_type: "gp2"
+        delete_on_termination: true
+    winrm_username: '{{ user "windows_user" }}'
+    winrm_insecure: true
+    winrm_use_ssl: true
+    winrm_timeout: "30m"
+    tags:
+      circle_build_url: '{{ user "circle_build_url" }}'
+      circle_job_name: '{{ user "circle_job_name" }}'
+      circle_sha: '{{ user "circle_sha" }}'
+      monorepo_content_sha: '{{ user "monorepo_content_sha" }}'
+    run_tags:
+      circle_build_url: '{{ user "circle_build_url" }}'
+    run_volume_tags:
+      circle_build_url: '{{ user "circle_build_url" }}'
+
+  - type: googlecompute
+    network: packer
+    image_name: windows-server-2019-vs2019-{{timestamp}}
+    image_family: windows-server-2019-vs2019
+    source_image_family: windows-2019
+    # This used to be 80GB but visual studio consumed an addtional 30GB. So This
+    # Was Doubled
+    disk_size: 160
+    # This is pd-ssd so that virus scan happens at a reasonable speed.
+    disk_type: pd-ssd
+
+    # Virus scan is much faster on a machine with a larger modern processer.
+    machine_type: "n1-standard-8"
+
+    project_id: '{{ user "project_id" }}'
+    account_file: '{{ user "account_file" }}'
+    zone: us-central1-a
+    state_timeout: "30m"
+
+    preemptible: false
+
+    communicator: "winrm"
+    winrm_username: '{{ user "windows_user" }}'
+    winrm_insecure: true
+    winrm_use_ssl: true
+    winrm_timeout: "30m"
+
+    metadata:
+      windows-startup-script-cmd: |
+        winrm set winrm/config/service/auth @{Basic=\"true\"}
+
+      windows-shutdown-script-ps1: |
+        & {{user `shutdown_script_folder`}}\GCEShutdownScript.ps1
+        & {{user `shutdown_script_folder`}}\ShutdownScript.ps1
+
+    image_labels:
+      region: '{{ user "gce_region" }}'
+      circle_hostname: '{{ user "circle_hostname" | clean_image_name }}'
+      circle_workflow_id: '{{ user "circle_workflow_id" | clean_image_name }}'
+      circle_job_name: '{{ user "circle_job_name" | clean_image_name }}'
+      circle_sha: '{{ user "circle_sha" | clean_image_name }}'
+      monorepo_content_sha: '{{ user "monorepo_content_sha" | clean_image_name }}'
+
+provisioners:
+  - type: file
+    source: "windows2019/ImageHelpers"
+    destination: "{{user `helper_script_folder`}}"
+
+  - type: file
+    source: "windows2019/validation-scripts"
+    destination: "{{user `test_script_folder`}}"
+
+  - type: file
+    source: "windows2019/shutdown-scripts"
+    destination: "C:\\"
+
+  - type: powershell
+    elevated_user: '{{ user "windows_user" }}'
+    elevated_password: "{{.WinRMPassword}}"
+    scripts:
+      - "windows2019/provision-scripts/update-pwsh.ps1"
+      # win update took more than 5 hour which is the limit for build run
+      # - "windows2019/provision-scripts/install-windows-updates.ps1"
+      - "windows2019/provision-scripts/cleanup-useless-defaults.ps1"
+      - "windows2019/provision-scripts/dscConfig.ps1"
+
+  - type: windows-restart
+
+  - type: powershell
+    elevated_user: '{{ user "windows_user" }}'
+    elevated_password: "{{.WinRMPassword}}"
+    scripts:
+      - "windows2019/provision-scripts/dscConfig.ps1"
+      # Uncomment below to change the system locale to Japan (CP932)
+      # システム ロケールを日本 (CP932) にする場合は下記を有効にしてください
+      # - "windows2019/provision-scripts/localize.ps1"
+
+  - type: windows-restart
+
+  - type: powershell
+    elevated_user: '{{ user "windows_user" }}'
+    elevated_password: "{{.WinRMPassword}}"
+    # Uncomment below to enable Docker registry mirror value to be passed as an environment variable
+    # NOTE: Packer will quote strings by default
+    # See https://developer.hashicorp.com/packer/docs/provisioners/shell#env_var_format
+    # environment_vars:
+    #   - DOCKERHUB_REGISTRY_MIRROR={{ user "dockerhub_registry_mirror" }}
+    scripts:
+      - "windows2019/provision-scripts/install-ssh.ps1"
+      - "windows2019/provision-scripts/update-pester.ps1"
+      - "windows2019/provision-scripts/enable-ec2launch.ps1"
+      - "windows2019/provision-scripts/enable-cleanup.ps1"
+      # Uncomment below to enable Docker registry mirror
+      # NOTE: this script requires the DOCKERHUB_REGISTRY_MIRROR environment variable
+      # - "windows2019/provision-scripts/configure-docker-daemon.ps1"
+      - "windows2019/provision-scripts/disable-windows-defender-scanner.ps1"
+      # The following errors as windows update did not run
+      # - "windows2019/validation-scripts/run-pester.ps1"
+
+  - type: file
+    source: "C:\\InstalledSoftware.md"
+    destination: "/tmp/artifacts/Vs2019-Server2019-Readme.md"
+    direction: "download"
+
+  - type: file
+    source: "C:\\test-results.xml"
+    destination: "{{ user `test_results_path` }}"
+    direction: "download"
+
+  - type: file
+    source: "C:\\ProgramData\\chocolatey\\logs\\chocolatey.log"
+    destination: "/tmp/artifacts/chocolatey.log"
+    direction: "download"
